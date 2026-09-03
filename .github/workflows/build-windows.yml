@@ -1,25 +1,35 @@
 name: Build Windows Installer
 
-# Builds the Windows x64 NSIS installer on a real windows-latest runner so
-# the "printer" native module (raw USB printing via the Win32 spooler) is
-# actually compiled and rebuilt against Electron's ABI.
+# Builds the Windows x64 NSIS installer on a real windows-latest runner.
 #
-# IMPORTANT: "printer" was moved from optionalDependencies to
-# dependencies (see package.json) specifically so npm CANNOT silently
-# swallow an install/compile failure the way it did before -- with
-# optionalDependencies, npm treats a network failure, missing build
-# tooling, and a genuine C++ compile error identically: it quietly
-# removes the partially-installed folder and reports success. As a
-# required dependency, the same failure now makes `npm ci` itself exit
-# non-zero, with --foreground-scripts streaming the real
-# prebuild-install/node-gyp/MSBuild/compiler output directly into this
-# log instead of hiding it in an npm debug file.
+# Why this workflow compiles `printer` by hand instead of letting npm/
+# electron-builder do it automatically:
 #
-# This is a deliberately temporary state for diagnosis. Once a Windows
-# build is green, printer can go back into optionalDependencies if you
-# don't want a Mac-only `npm install` ever blocked by a Windows-only
-# native module (it isn't currently used on macOS -- CUPS `lp` is used
-# there instead).
+# 1. The pinned tojocky/node-printer commit does NOT declare node-gyp as
+#    its own dependency (checked its package.json directly) -- its
+#    install script ("prebuild-install || node-gyp rebuild") falls back
+#    to whatever node-gyp is ambient on the machine. On GitHub's
+#    windows-latest image that resolved to node-gyp@6.1.0, whose Visual
+#    Studio detector predates the runner's VS major version
+#    ("Visual Studio\18\Enterprise") and fails with
+#    "find VS unknown version 'undefined'" before compilation even
+#    starts.
+# 2. electron-builder's own packaging step *also* runs an automatic
+#    native-module rebuild pass by default before packaging
+#    (app-builder-lib's Packager.installAppDependencies, gated on
+#    `npmRebuild !== false`) -- confirmed by reading its source. That
+#    pass doesn't pin a modern node-gyp either, so left enabled it could
+#    silently redo the same broken rebuild and clobber a correctly
+#    compiled binary. package.json now sets `"npmRebuild": false`.
+#
+# So the strategy is: install without running ANY lifecycle scripts
+# (`npm ci --ignore-scripts`), then explicitly compile printer ourselves
+# using a modern node-gyp we pin as our own devDependency
+# ("node-gyp": "^13.0.2"), targeted directly at Electron 31's ABI via
+# node-gyp's own --target/--arch/--dist-url/--runtime flags -- the same
+# parameters electron-builder's own rebuild path sets internally
+# (npm_config_target / npm_config_disturl=https://electronjs.org/headers
+# / npm_config_runtime=electron), just under our explicit control.
 
 on:
   workflow_dispatch: {}
@@ -52,9 +62,9 @@ jobs:
           node-version: "20"
           cache: "npm"
 
-      # Informational only -- confirms what's actually on this runner
-      # before we blame the toolchain for anything. Does not install
-      # anything and never fails the job.
+      # Informational only -- never fails the job. Shows what's actually
+      # on the runner, including the fact that VS is present (this was
+      # never really in question -- old node-gyp just couldn't see it).
       - name: Report build tooling present on this runner
         shell: pwsh
         continue-on-error: true
@@ -72,20 +82,67 @@ jobs:
           } else {
             Write-Host "vswhere.exe not found at expected path"
           }
-          Write-Host "--- node-gyp (as npm would invoke it) ---"
-          npx --yes node-gyp --version
+          Write-Host "--- ambient node-gyp note ---"
+          Write-Host "The legacy path (printer's own install script, or a plain 'npm rebuild') resolves node-gyp@6.1.0 on this runner, whose VS detector predates this image's Visual Studio major version. We do not rely on that copy -- see the explicit compile step below, which uses this project's own pinned devDependency instead."
 
-      # printer is now a REQUIRED dependency (see comment above), and
-      # --foreground-scripts streams every package's install-script
-      # output live instead of only summarizing pass/fail. If
-      # prebuild-install and node-gyp both fail for printer, this step
-      # fails the job right here, with the real error visible above.
-      - name: Install dependencies (npm ci --foreground-scripts)
-        run: npm ci --foreground-scripts --verbose
+      # --ignore-scripts is the key change: it installs every package's
+      # files WITHOUT running any lifecycle script. That means printer's
+      # own broken "prebuild-install || node-gyp rebuild" install script
+      # never runs here (so it can't fail the whole install), and our own
+      # top-level "postinstall": "electron-builder install-app-deps"
+      # doesn't run prematurely either -- we call the real compile step
+      # explicitly, below, in full view.
+      - name: Install dependencies (npm ci --ignore-scripts)
+        run: npm ci --ignore-scripts
 
-      # Requirement: exact PowerShell diagnostics, always run (even if
-      # the step above already failed) so we can see exactly what state
-      # node_modules/printer was left in.
+      - name: Confirm our pinned modern node-gyp
+        run: npx --no-install node-gyp --version
+
+      # This is the actual fix: compile printer directly against
+      # Electron 31's ABI using OUR pinned node-gyp (^13.0.2), not
+      # whatever ambient copy the runner or printer's own install script
+      # would otherwise reach for. --target/--dist-url/--runtime mirror
+      # exactly what electron-builder's own rebuild path sets via
+      # npm_config_target / npm_config_disturl / npm_config_runtime
+      # (verified in app-builder-lib's util/yarn.js).
+      - name: Compile printer for Electron 31 (explicit modern node-gyp)
+        run: |
+          set -euo pipefail
+          if [ ! -d node_modules/printer ]; then
+            echo "::error::node_modules/printer does not exist after npm ci --ignore-scripts. That step only extracts package files without running scripts, so this means the dependency itself failed to resolve/download -- check the 'Install dependencies' step's log."
+            exit 1
+          fi
+
+          ELECTRON_VERSION="$(node -p "require('./node_modules/electron/package.json').version")"
+          echo "Target Electron version: $ELECTRON_VERSION"
+
+          NODE_GYP_BIN="$(pwd)/node_modules/.bin/node-gyp"
+          echo "Using node-gyp: $NODE_GYP_BIN ($("$NODE_GYP_BIN" --version))"
+
+          (
+            cd node_modules/printer
+            "$NODE_GYP_BIN" rebuild \
+              --target="$ELECTRON_VERSION" \
+              --arch=x64 \
+              --dist-url=https://electronjs.org/headers \
+              --runtime=electron \
+              --verbose
+          )
+
+          # Safety net: printer's binding.gyp has an "action_after_build"
+          # target that copies build/Release/node_printer.node to
+          # lib/node_printer.node (lib/printer.js requires it from there,
+          # not from build/Release/ directly). `node-gyp rebuild` with no
+          # explicit target should run gyp's default target and perform
+          # this copy, but we don't rely on that implicitly -- we verify
+          # and, if needed, do it ourselves so a require('printer') can
+          # never fail purely because of a missed copy step.
+          if [ ! -f node_modules/printer/lib/node_printer.node ]; then
+            echo "lib/node_printer.node missing after rebuild -- copying explicitly from build/Release/"
+            cp node_modules/printer/build/Release/node_printer.node node_modules/printer/lib/node_printer.node
+          fi
+
+      # Requirement: exact PowerShell diagnostics of the compiled state.
       - name: Diagnose node_modules/printer state
         if: always()
         shell: pwsh
@@ -103,37 +160,18 @@ jobs:
               Write-Host "No *.node files found under node_modules/printer."
             }
           } else {
-            Write-Host "node_modules/printer does not exist -- npm ci already failed/removed it. See the 'Install dependencies' step's log above for the real prebuild-install/node-gyp/MSBuild error."
+            Write-Host "node_modules/printer does not exist."
           }
-
-      # Isolated, single-package re-run of printer's own install script
-      # with maximum verbosity, per the requested diagnostic strategy.
-      # If npm ci above already failed, node_modules/printer won't
-      # exist -- skip cleanly here rather than emitting a second,
-      # confusing "no such package" error; the real failure is already
-      # visible in the "Install dependencies" step.
-      - name: Explicit printer rebuild (foreground-scripts, verbose)
-        if: always()
-        run: |
-          set -euo pipefail
-          if [ ! -d node_modules/printer ]; then
-            echo "::warning::node_modules/printer does not exist -- skipping the isolated rebuild (npm ci already failed on it; see that step's log)."
-            exit 0
-          fi
-          npm rebuild printer --foreground-scripts --verbose
 
       - name: Compile TypeScript
         run: npm run build
 
-      # Gate A -- require/loading gate: prove printer.node actually
-      # matches Electron 31's ABI, not just plain Node 20's, by loading
-      # it inside Electron's own Node runtime (ELECTRON_RUN_AS_NODE runs
-      # Electron headlessly, no window).
+      # Gate A -- require/loading gate.
       - name: "Gate A: require('printer') under Electron's ABI"
         run: |
           set -euo pipefail
-          if [ ! -d node_modules/printer ]; then
-            echo "::error::node_modules/printer does not exist -- cannot even attempt to load it. See the 'Install dependencies' step's log for the real error."
+          if [ ! -f node_modules/printer/lib/node_printer.node ]; then
+            echo "::error::node_modules/printer/lib/node_printer.node does not exist -- the compile step above did not produce it. See its log."
             exit 1
           fi
           ELECTRON_RUN_AS_NODE=1 npx --no-install electron -e "
@@ -150,16 +188,14 @@ jobs:
       - name: Build Windows x64 NSIS installer
         run: npm run build:win
 
-      # Gate B -- packaging gate: even if the module loaded fine above,
-      # a misconfigured asarUnpack/files filter could still leave it out
-      # of the actual shipped app.
+      # Gate B -- packaging gate.
       - name: "Gate B: packaged app contains the native .node binary"
         run: |
           set -euo pipefail
           echo "Searching release/ for packaged *.node files..."
           NODE_FILES="$(find release -iname '*.node' 2>/dev/null || true)"
           if [ -z "$NODE_FILES" ]; then
-            echo "::error::No .node native module files found anywhere under release/ after packaging. Failing this workflow on purpose -- an .exe without the native printing component is not a successful build."
+            echo "::error::No .node native module files found anywhere under release/ after packaging. Failing this workflow on purpose."
             echo "---- Full release/ contents, for debugging ----"
             find release -type f | sort || true
             exit 1
