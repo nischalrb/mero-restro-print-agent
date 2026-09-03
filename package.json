@@ -23,9 +23,7 @@
   },
   "dependencies": {
     "express": "^4.19.2",
-    "uuid": "^9.0.1"
-  },
-  "optionalDependencies": {
+    "uuid": "^9.0.1",
     "printer": "github:tojocky/node-printer#4542194"
   },
   "devDependencies": {
