@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  A per-user LaunchAgent — macOS's standard mechanism for "run this
+  quietly in the background whenever I log in", the equivalent of the
+  Windows Startup-folder shortcut. RunAtLoad starts it immediately when
+  loaded; KeepAlive restarts it if it ever crashes, so a restaurant's
+  printing doesn't silently stop working until someone notices and
+  manually restarts the agent.
+
+  install-macos-launchagent.sh copies this file into
+  ~/Library/LaunchAgents and fills in the real binary path — don't edit
+  the ExecutablePath placeholder by hand, that script does it.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.merorestro.printagent</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>__EXECUTABLE_PATH__</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>__LOG_DIR__/agent-stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>__LOG_DIR__/agent-stderr.log</string>
+</dict>
+</plist>

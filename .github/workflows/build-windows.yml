@@ -1,0 +1,112 @@
+name: Build Windows Installer
+
+# Builds the Windows x64 NSIS installer on a real windows-latest runner so
+# the "printer" native module (raw USB printing via the Win32 spooler) is
+# actually compiled and rebuilt against Electron's ABI, instead of being
+# silently skipped the way it is when this project is built/cross-compiled
+# from a Mac. The job is intentionally NOT allowed to report success if
+# that native component ends up missing from the packaged app — an .exe
+# that electron-builder produced is not the same thing as a working
+# Windows USB print path (see the two verification steps below).
+
+on:
+  workflow_dispatch: {}
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "electron/**"
+      - "scripts/**"
+      - "build/**"
+      - "package.json"
+      - "package-lock.json"
+      - "tsconfig.json"
+      - ".github/workflows/build-windows.yml"
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      # Runs `npm install` from the committed package-lock.json. This is
+      # also what triggers the "postinstall": "electron-builder
+      # install-app-deps" script (see package.json) — that step rebuilds
+      # any native modules (printer included) against Electron 31's ABI,
+      # not just plain Node 20's. Without it, a native module compiled
+      # during plain `npm ci` would load under Node but crash/refuse to
+      # load inside the packaged Electron app (NODE_MODULE_VERSION
+      # mismatch).
+      - name: Install dependencies (npm ci)
+        run: npm ci
+
+      - name: Compile TypeScript
+        run: npm run build
+
+      # Functional proof, not just "the folder exists": load the compiled
+      # printer.node directly inside Electron's own Node runtime
+      # (ELECTRON_RUN_AS_NODE runs Electron headlessly, no window, as a
+      # plain Node-API-compatible process) to prove the binary actually
+      # matches Electron 31's ABI. This is the check that catches a
+      # native module that compiled fine but was built for the wrong
+      # runtime.
+      - name: Smoke-test printer module under Electron's ABI
+        run: |
+          set -euo pipefail
+          if [ ! -d node_modules/printer ]; then
+            echo "::error::node_modules/printer does not exist after npm ci — the optional native dependency failed to install. Check the 'npm ci' step's log above for the real error (network fetch, missing build tools, or a genuine compile failure in the printer source)."
+            exit 1
+          fi
+          echo "Requiring 'printer' inside Electron's Node runtime (ELECTRON_RUN_AS_NODE=1)..."
+          ELECTRON_RUN_AS_NODE=1 npx --no-install electron -e "
+            try {
+              const p = require('printer');
+              console.log('OK: printer module loaded under Electron ABI. Exports:', Object.keys(p).join(', '));
+            } catch (e) {
+              console.error('FAIL: printer module did not load under Electron\\'s ABI:');
+              console.error(e.stack);
+              process.exit(1);
+            }
+          "
+
+      - name: Build Windows x64 NSIS installer
+        run: npm run build:win
+
+      # Presence check on the actual shipped artifact: even if the module
+      # loads fine in the previous step, a misconfigured `asarUnpack` glob
+      # or `files` filter could still leave it out of the packaged app.
+      - name: Verify packaged app contains the native .node binary
+        run: |
+          set -euo pipefail
+          echo "Searching release/ for packaged *.node files..."
+          NODE_FILES="$(find release -iname '*.node' 2>/dev/null || true)"
+          if [ -z "$NODE_FILES" ]; then
+            echo "::error::No .node native module files found anywhere under release/ after packaging. The 'printer' native component did not make it into the installer, so USB printing on Windows would silently fail in this build. Failing this workflow on purpose — an .exe without the native printing component is not a successful build."
+            echo "---- Full release/ contents, for debugging ----"
+            find release -type f | sort || true
+            exit 1
+          fi
+          echo "Found packaged .node file(s):"
+          echo "$NODE_FILES"
+
+      - name: Show installer output
+        run: find release -maxdepth 1 -iname "*.exe" -exec ls -la {} \;
+
+      - name: Upload Windows installer artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mero-restro-print-agent-windows-installer
+          path: release/*.exe
+          if-no-files-found: error

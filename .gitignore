@@ -1,0 +1,12 @@
+node_modules/
+release/
+dist/
+dist-pkg/
+mac-arm64/
+mac-universal/
+win-unpacked/
+win-arm64-unpacked/
+*.dmg
+*.exe
+*.blockmap
+.DS_Store

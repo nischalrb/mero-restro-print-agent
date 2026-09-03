@@ -1,0 +1,106 @@
+{
+  "name": "mero-restro-print-agent",
+  "productName": "Mero Restro Print Agent",
+  "version": "1.2.1",
+  "description": "Local background service that lets the Mero Restro web app (app.merorestroapp.com) print receipts and kitchen tickets to a USB/LAN thermal printer physically connected to this computer, over ESC/POS.",
+  "author": "Mero Restro",
+  "private": true,
+  "main": "electron/main.js",
+  "type": "commonjs",
+  "scripts": {
+    "dev": "ts-node-dev --respawn --transpile-only src/index.ts",
+    "print-agent": "ts-node-dev --respawn --transpile-only src/index.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "icon": "node scripts/gen-placeholder-icon.js",
+    "electron:dev": "npm run build && electron .",
+    "build:mac": "npm run build && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --mac --arm64",
+    "build:win": "npm run build && electron-builder --win nsis --x64",
+    "package:win": "npm run build && pkg . --targets node18-win-x64 --output dist-pkg/mero-restro-print-agent-win.exe",
+    "package:mac": "npm run build && pkg . --targets node18-macos-x64,node18-macos-arm64 --output dist-pkg/mero-restro-print-agent-macos",
+    "build:mac:universal": "npm run build && electron-builder --mac --universal",
+    "postinstall": "electron-builder install-app-deps"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "uuid": "^9.0.1"
+  },
+  "optionalDependencies": {
+    "printer": "github:tojocky/node-printer#4542194"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.21",
+    "@types/node": "^20.14.0",
+    "@types/uuid": "^9.0.8",
+    "electron": "^31.3.0",
+    "electron-builder": "^24.13.3",
+    "pkg": "^5.8.1",
+    "ts-node-dev": "^2.0.0",
+    "typescript": "^5.5.0"
+  },
+  "pkg": {
+    "assets": [],
+    "targets": [
+      "node18-win-x64",
+      "node18-macos-x64",
+      "node18-macos-arm64"
+    ]
+  },
+  "build": {
+    "appId": "com.merorestro.printagent",
+    "productName": "Mero Restro Print Agent",
+    "directories": {
+      "output": "release",
+      "buildResources": "build"
+    },
+    "files": [
+      "electron/**/*",
+      "dist/**/*",
+      "package.json",
+      "!**/*.map"
+    ],
+    "asarUnpack": [
+      "node_modules/printer/**/*"
+    ],
+    "extraMetadata": {
+      "main": "electron/main.js"
+    },
+    "mac": {
+      "category": "public.app.category.business",
+      "icon": "build/icon.png",
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "universal"
+          ]
+        }
+      ],
+      "extendInfo": {
+        "LSUIElement": true
+      },
+      "gatekeeperAssess": false
+    },
+    "dmg": {
+      "title": "Mero Restro Print Agent"
+    },
+    "win": {
+      "icon": "build/icon.png",
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "perMachine": false,
+      "createDesktopShortcut": false
+    },
+    "afterSign": "scripts/afterSign.js"
+  }
+}
