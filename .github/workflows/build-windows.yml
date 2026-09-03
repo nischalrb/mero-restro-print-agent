@@ -56,10 +56,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Node 20
+      - name: Set up Node 22
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "22"
           cache: "npm"
 
       # Informational only -- never fails the job. Shows what's actually
@@ -94,6 +94,22 @@ jobs:
       # explicitly, below, in full view.
       - name: Install dependencies (npm ci --ignore-scripts)
         run: npm ci --ignore-scripts
+
+      # Requirement: prove exactly what runtime/dependency versions this
+      # run actually used, since the previous failure (Node 20.20.2 +
+      # node-gyp 13's bundled undici hitting a WHATWG webidl API missing
+      # from that Node version) was a runtime/dependency mismatch, not a
+      # VS or compiler problem.
+      - name: Report Node/npm/node-gyp/undici versions in use
+        run: |
+          echo "node --version:"
+          node --version
+          echo "npm --version:"
+          npm --version
+          echo "node-gyp version (as resolved in node_modules):"
+          node -p "require('node-gyp/package.json').version"
+          echo "undici version (as resolved in node_modules, pulled in by node-gyp):"
+          node -p "require('undici/package.json').version"
 
       - name: Confirm our pinned modern node-gyp
         run: npx --no-install node-gyp --version
