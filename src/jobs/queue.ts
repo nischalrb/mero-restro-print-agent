@@ -170,8 +170,15 @@ async function runJob(job: PrintJob, buildBuffer: () => Buffer, target: RawPrint
     // success in this log.
     logger.info(`Job ${job.id} (${job.jobType}) printed to "${job.printer}" (${buffer.length} bytes).`);
   } catch (err) {
+    // Cast to pick up the optional errorCode/nativePrinterError properties
+    // rawPrint.ts's sendViaWindowsSpooler() attaches to a native-module
+    // load failure — plain printer/CUPS failures won't have these, so both
+    // end up null, same as before this diagnostic was added.
+    const typedErr = err as Error & { errorCode?: string; nativePrinterError?: string };
     job.status = "failed";
-    job.error = (err as Error).message;
+    job.error = typedErr.message;
+    job.errorCode = typedErr.errorCode ?? null;
+    job.nativePrinterError = typedErr.nativePrinterError ?? null;
     logger.error(`Job ${job.id} (${job.jobType}) failed on "${job.printer}": ${job.error}`);
   }
 }

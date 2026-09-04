@@ -120,6 +120,16 @@ export interface PrintJob {
   createdAt: string;
   status: JobStatus;
   error?: string | null;
+  /**
+   * Short, redacted classifier for a native-module load failure (e.g.
+   * "PRINTER_NATIVE_MODULE_LOAD_FAILED") — safe to surface over HTTP. Added
+   * for Windows USB printer-diagnostics; additive only, existing callers
+   * that don't read it are unaffected. See rawPrint.ts's
+   * logDetailedPrinterLoadFailure() for the full (local-log-only) detail.
+   */
+  errorCode?: string | null;
+  /** Redacted "Name (code): message" string for the same failure — never includes filesystem paths. */
+  nativePrinterError?: string | null;
 }
 
 export interface DiscoveredPrinter {

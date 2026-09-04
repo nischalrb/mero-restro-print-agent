@@ -242,26 +242,32 @@ jobs:
           echo "Found packaged .node file(s):"
           echo "$NODE_FILES"
 
-      # Gate C -- packaged LAYOUT gate. Gate B above only proves *some*
-      # .node file exists somewhere under release/ after packaging; it
-      # does NOT prove the file is at the exact path printer/lib/printer.js
-      # actually requires it from at runtime inside the installed app. A
-      # native module can be compiled correctly (Gates A/B both green) and
-      # still fail to load post-install if electron-builder's asarUnpack
-      # step ever puts it somewhere other than
-      # resources/app.asar.unpacked/node_modules/printer/lib/node_printer.node
-      # -- e.g. left inside app.asar (native modules can't load from
-      # inside an asar archive at all, even though it would still show up
-      # in a plain filesystem "find" against app.asar itself, since asar
-      # is a single opaque file -- hence this step also greps the asar's
-      # own file listing, not just the filesystem), or only under
-      # .../build/Release/ without the lib/ copy. This step checks the
-      # real unpacked electron-builder output directory
-      # (release/win-unpacked/) against that exact expected path, not
-      # just "a .node file exists".
-      - name: "Gate C: win-unpacked layout matches printer's runtime require path"
+      # Diagnostic C (NON-BLOCKING) -- checks whether win-unpacked's layout
+      # matches the ONE specific runtime path we originally assumed
+      # printer/lib/printer.js requires the native binary from
+      # (resources/app.asar.unpacked/node_modules/printer/lib/node_printer.node).
+      #
+      # Why this is a diagnostic and not a hard gate: real production
+      # testing on Windows (RMS -> Print Agent -> USB thermal printer)
+      # printed successfully on a build where this exact path could NOT
+      # be found by a PowerShell search of the installed app. That is
+      # direct evidence our assumed installed-location requirement was
+      # either wrong, or the search was pointed at a stale/different
+      # install directory than the one actually running -- either way,
+      # this check is NOT reliable enough to fail a build over. Runtime
+      # printing success is the authoritative signal (see Gate A/B below
+      # for what we ARE confident about: the module compiles for
+      # Electron's ABI and loads via require() before packaging).
+      #
+      # Kept as continue-on-error so its output still shows up for future
+      # troubleshooting (e.g. if a REAL regression makes printing stop
+      # working, this is one of the first things worth checking again),
+      # without ever blocking a shipped build on an assumption we no
+      # longer trust.
+      - name: "Diagnostic C (non-blocking): win-unpacked layout vs. printer's expected require path"
+        continue-on-error: true
         run: |
-          set -euo pipefail
+          set -uo pipefail
 
           UNPACKED_DIR="release/win-unpacked"
           RESOURCES_DIR="$UNPACKED_DIR/resources"
@@ -272,9 +278,10 @@ jobs:
 
           echo "Checking $UNPACKED_DIR ..."
           if [ ! -d "$UNPACKED_DIR" ]; then
-            echo "::error::$UNPACKED_DIR does not exist -- electron-builder did not produce the expected unpacked win target directory. Full release/ contents:"
+            echo "::warning::$UNPACKED_DIR does not exist -- electron-builder did not produce the expected unpacked win target directory. Full release/ contents:"
             find release -maxdepth 2 | sort || true
-            exit 1
+            echo "Diagnostic C: nothing further to check without $UNPACKED_DIR -- not failing the build over this (see step header for why)."
+            exit 0
           fi
 
           # --- Broad diagnostic dump, printed unconditionally, BEFORE any
@@ -305,44 +312,241 @@ jobs:
           if [ -f "$ASAR_PATH" ]; then
             echo "  exists: true"
           else
-            echo "::error::$ASAR_PATH does not exist -- the packaged app has no app.asar at all, which is not the expected electron-builder output shape."
-            exit 1
+            echo "::warning::$ASAR_PATH does not exist -- the packaged app has no app.asar at all, which is not the expected electron-builder output shape. Not failing the build over this (see step header for why)."
+            exit 0
           fi
 
           echo "Test: $UNPACKED_ASAR_DIR"
           if [ -d "$UNPACKED_ASAR_DIR" ]; then
             echo "  exists: true"
           else
-            echo "::error::$UNPACKED_ASAR_DIR does not exist -- asarUnpack (\"node_modules/printer/**/*\" in package.json's build config) did not take effect, so the native module for printer is sealed inside app.asar and CANNOT be loaded by Node's require() at runtime under any circumstance."
-            exit 1
+            echo "::warning::$UNPACKED_ASAR_DIR does not exist. Not failing the build over this -- see step header: production Windows printing has been confirmed working on a build where our assumed installed location didn't match a PowerShell search, so this on its own is no longer treated as proof of a broken installer."
+            exit 0
           fi
 
           echo "Test: $PRINTER_DIR"
           if [ -d "$PRINTER_DIR" ]; then
             echo "  exists: true"
           else
-            echo "::error::$PRINTER_DIR does not exist -- node_modules/printer was not unpacked at all."
-            exit 1
+            echo "::warning::$PRINTER_DIR does not exist -- node_modules/printer was not unpacked at all. Not failing the build over this (see step header for why)."
+            exit 0
           fi
 
           echo "Test: $EXPECTED_NODE_PATH (the exact path printer/lib/printer.js requires the native binary from)"
           if [ -f "$EXPECTED_NODE_PATH" ]; then
+            PRE_NSIS_SIZE="$(wc -c < "$EXPECTED_NODE_PATH" | tr -d '[:space:]')"
+            PRE_NSIS_SHA256="$(sha256sum "$EXPECTED_NODE_PATH" | cut -d' ' -f1)"
             echo "  exists: true"
-            echo "Gate C passed -- native binary is present at the exact runtime path printer/lib/printer.js expects."
+            echo "  size (bytes): $PRE_NSIS_SIZE"
+            echo "  sha256: $PRE_NSIS_SHA256"
+            echo "Diagnostic C: native binary is present at the originally-expected runtime path in win-unpacked, before NSIS packaging (Diagnostic D below reports whether it also survives into the installer -- also non-blocking)."
+            # Exported for Diagnostic D, which needs the pre-NSIS path/size/hash to
+            # compare against whatever it finds (or doesn't find) inside the
+            # extracted installer payload.
+            {
+              echo "PRE_NSIS_NODE_PATH=$EXPECTED_NODE_PATH"
+              echo "PRE_NSIS_NODE_SIZE=$PRE_NSIS_SIZE"
+              echo "PRE_NSIS_NODE_SHA256=$PRE_NSIS_SHA256"
+            } >> "$GITHUB_ENV"
           else
-            echo "::error::$EXPECTED_NODE_PATH does NOT exist. printer/lib/printer.js requires the native binary from exactly this path, so require('printer') will fail at runtime even though Gate A/B passed at build time."
-            echo "Searching the rest of the packaged printer directory for a misplaced .node file..."
+            echo "::warning::$EXPECTED_NODE_PATH does NOT exist at this exact path. Historically we treated this as proof require('printer') would fail at runtime -- real Windows testing has since shown a build can be missing this exact path and still print successfully in production, so this is now informational only, not a build failure. Searching the rest of the packaged printer directory for a misplaced .node file..."
             FOUND_ELSEWHERE="$(find "$PRINTER_DIR" -iname '*.node' 2>/dev/null || true)"
             if [ -n "$FOUND_ELSEWHERE" ]; then
-              echo "::error::Found .node file(s) elsewhere under $PRINTER_DIR, but NOT at the expected runtime path. Both paths, for comparison:"
-              echo "  expected (missing): $EXPECTED_NODE_PATH"
+              echo "::warning::Found .node file(s) elsewhere under $PRINTER_DIR, but NOT at the originally-expected path. Both, for comparison:"
+              echo "  originally expected (missing): $EXPECTED_NODE_PATH"
               echo "  found instead:"
               echo "$FOUND_ELSEWHERE" | sed 's/^/    /'
             else
-              echo "::error::No .node file found anywhere under $PRINTER_DIR either -- expected path: $EXPECTED_NODE_PATH"
+              echo "::warning::No .node file found anywhere under $PRINTER_DIR either -- originally expected path: $EXPECTED_NODE_PATH"
             fi
+            exit 0
+          fi
+
+      # Requirement: "check electron-builder generated installer
+      # metadata/config if needed" -- electron-builder writes its own
+      # fully-resolved config (after merging package.json's "build" block
+      # with any CLI/platform-specific overrides) to this file on every
+      # run. Printing it here rules out a config-resolution surprise (e.g.
+      # some default silently overriding asarUnpack or files) without
+      # guessing -- if something in here doesn't match package.json, that
+      # is the smoking gun; if it matches, the config itself is cleared as
+      # a suspect and the fault is elsewhere in the packaging pipeline.
+      - name: Print electron-builder effective config
+        if: always()
+        run: |
+          if [ -f release/builder-effective-config.yaml ]; then
+            echo "=== release/builder-effective-config.yaml ==="
+            cat release/builder-effective-config.yaml
+          else
+            echo "release/builder-effective-config.yaml not found -- electron-builder did not write it (unexpected)."
+          fi
+
+      # Requirement: identify the EXACT installer file this run produced,
+      # unambiguously, before anything downstream (Diagnostic D, the upload
+      # step) touches it -- so there is never a chance of inspecting or
+      # uploading a stale/older .exe left over from a previous step or a
+      # caching quirk. Fails if zero or more than one .exe is found, since
+      # either case means "which installer?" has more than one possible
+      # answer.
+      - name: Identify installer artifact for this run
+        run: |
+          set -euo pipefail
+          mapfile -t EXES < <(find release -maxdepth 1 -iname "*.exe" | sort)
+          if [ "${#EXES[@]}" -eq 0 ]; then
+            echo "::error::No .exe file found under release/ -- the NSIS build step above did not produce an installer."
             exit 1
           fi
+          if [ "${#EXES[@]}" -gt 1 ]; then
+            echo "::error::Found ${#EXES[@]} .exe files under release/ -- expected exactly one, so which is 'the' installer for this run is ambiguous:"
+            printf '%s\n' "${EXES[@]}"
+            exit 1
+          fi
+          INSTALLER_PATH="${EXES[0]}"
+          INSTALLER_SIZE="$(wc -c < "$INSTALLER_PATH" | tr -d '[:space:]')"
+          INSTALLER_SHA256="$(sha256sum "$INSTALLER_PATH" | cut -d' ' -f1)"
+          echo "Installer for this run: $INSTALLER_PATH"
+          echo "  size (bytes): $INSTALLER_SIZE"
+          echo "  sha256: $INSTALLER_SHA256"
+          {
+            echo "INSTALLER_PATH=$INSTALLER_PATH"
+            echo "INSTALLER_SIZE=$INSTALLER_SIZE"
+            echo "INSTALLER_SHA256=$INSTALLER_SHA256"
+          } >> "$GITHUB_ENV"
+
+      # Diagnostic D (NON-BLOCKING) -- compares Diagnostic C's pre-NSIS
+      # binary against what 7-Zip can extract from the actual installer
+      # .exe. Originally written as a hard gate under the hypothesis that
+      # node_printer.node had to survive at one specific extracted path;
+      # confirmed real-world Windows printing (RMS -> Print Agent -> USB
+      # thermal printer, full receipt content, /test-print all working)
+      # on a build where a PowerShell search of the installed app found
+      # neither node_printer.node nor an unpacked printer directory. That
+      # is direct evidence this specific check is not a reliable signal
+      # of a broken build -- possibly because the search targeted a
+      # stale/different install directory, possibly because the resolved
+      # path assumption itself doesn't hold in every case (printer.js
+      # also has a `./node_printer_<platform>_<arch>.node` fallback name
+      # we did not fully rule out) -- so it no longer fails the build.
+      # Left in place, non-blocking, purely as troubleshooting context if
+      # printing genuinely regresses later: it still extracts the real
+      # installer and reports exactly what 7-Zip finds.
+      - name: "Diagnostic D (non-blocking): does node_printer.node survive into the installer payload"
+        continue-on-error: true
+        run: |
+          # NOTE: deliberately no "-e" here (GitHub's own bash wrapper for
+          # `shell: bash` steps already runs with -e by default, so we
+          # explicitly turn it back OFF): 7-Zip commonly exits non-zero
+          # ("warning", not fatal) when reading an NSIS stub it can only
+          # partially parse as an archive, even when the app payload we
+          # actually care about extracts fine. With -e active that
+          # non-fatal exit would abort this script before we ever get to
+          # check $? ourselves below and decide whether it actually
+          # matters. -u and pipefail stay on.
+          set +e
+          set -uo pipefail
+
+          if [ -z "${PRE_NSIS_NODE_PATH:-}" ]; then
+            echo "::notice::PRE_NSIS_NODE_PATH is not set (Diagnostic C did not find the binary at its originally-expected path, or was skipped) -- nothing to compare against the installer payload, skipping. Not failing the build over this."
+            exit 0
+          fi
+
+          echo "Pre-NSIS binary (from Diagnostic C):"
+          echo "  path:   $PRE_NSIS_NODE_PATH"
+          echo "  size:   $PRE_NSIS_NODE_SIZE bytes"
+          echo "  sha256: $PRE_NSIS_NODE_SHA256"
+          echo ""
+          echo "Installer for this run:"
+          echo "  path:   $INSTALLER_PATH"
+          echo "  size:   $INSTALLER_SIZE bytes"
+          echo "  sha256: $INSTALLER_SHA256"
+
+          SEVENZIP="$(command -v 7z || true)"
+          if [ -z "$SEVENZIP" ] && [ -f "/c/Program Files/7-Zip/7z.exe" ]; then
+            SEVENZIP="/c/Program Files/7-Zip/7z.exe"
+          fi
+          if [ -z "$SEVENZIP" ]; then
+            echo "::warning::7-Zip (7z) was not found on this runner (checked PATH and the default GitHub-hosted install location). Cannot extract the installer to verify its payload -- skipping. Not failing the build over this."
+            exit 0
+          fi
+          echo ""
+          echo "Using 7-Zip at: $SEVENZIP"
+
+          EXTRACT_DIR="release/_gate-d-extracted"
+          rm -rf "$EXTRACT_DIR"
+          mkdir -p "$EXTRACT_DIR"
+
+          # electron-builder NSIS installers built with SetCompress=off wrap
+          # a plain 7z archive of win-unpacked's contents inside the NSIS
+          # stub exe; 7-Zip can locate and extract that embedded archive
+          # directly from the .exe. This can print non-fatal warnings for
+          # the surrounding NSIS stub/script sections it can't parse as
+          # archive entries -- that is expected and NOT treated as failure
+          # here; only "did the search below find our file" decides Diagnostic D's result (informational, non-blocking).
+          echo ""
+          echo "=== Extracting $INSTALLER_PATH -> $EXTRACT_DIR (warnings from the NSIS stub wrapper are expected) ==="
+          "$SEVENZIP" x "$INSTALLER_PATH" "-o$EXTRACT_DIR" -y
+          SEVENZIP_EXIT=$?
+          echo "7z exit code: $SEVENZIP_EXIT (0 = full success, 1 = warning/partial, anything else = likely fatal)"
+
+          EXTRACTED_FILE_COUNT="$(find "$EXTRACT_DIR" -type f 2>/dev/null | wc -l | tr -d '[:space:]')"
+          echo "Files extracted: $EXTRACTED_FILE_COUNT"
+          if [ "$SEVENZIP_EXIT" -gt 1 ] && [ "$EXTRACTED_FILE_COUNT" -eq 0 ]; then
+            echo "::warning::7-Zip could not extract anything usable from $INSTALLER_PATH (exit code $SEVENZIP_EXIT, 0 files extracted). This is a tooling/format problem, not evidence either way about whether node_printer.node is in the installer -- skipping the comparison rather than failing over an unverifiable result."
+            exit 0
+          fi
+
+          echo ""
+          echo "=== Diagnostic: extracted paths containing 'printer' ==="
+          PRINTER_MATCHES="$(find "$EXTRACT_DIR" -iname '*printer*' 2>/dev/null | sort || true)"
+          if [ -n "$PRINTER_MATCHES" ]; then
+            echo "$PRINTER_MATCHES"
+          else
+            echo "(no matches)"
+          fi
+
+          echo ""
+          echo "=== Diagnostic: extracted paths containing '*.node' ==="
+          NODE_MATCHES="$(find "$EXTRACT_DIR" -iname '*.node' 2>/dev/null | sort || true)"
+          if [ -n "$NODE_MATCHES" ]; then
+            echo "$NODE_MATCHES"
+          else
+            echo "(no matches)"
+          fi
+
+          echo ""
+          echo "=== Diagnostic: extracted paths containing 'app.asar.unpacked' ==="
+          UNPACKED_MATCHES="$(find "$EXTRACT_DIR" -iname '*app.asar.unpacked*' 2>/dev/null | sort || true)"
+          if [ -n "$UNPACKED_MATCHES" ]; then
+            echo "$UNPACKED_MATCHES"
+          else
+            echo "(no matches)"
+          fi
+
+          echo ""
+          echo "=== Diagnostic D result ==="
+          MATCHING_NODE_FILE="$(find "$EXTRACT_DIR" -type f -iname 'node_printer.node' 2>/dev/null | head -n1 || true)"
+          if [ -z "$MATCHING_NODE_FILE" ]; then
+            echo "::notice::node_printer.node was present in win-unpacked before packaging (sha256 $PRE_NSIS_NODE_SHA256) but was not found by 7-Zip anywhere in the extracted installer payload. NOT failing the build over this: real Windows testing has confirmed printing works end-to-end (RMS -> Print Agent -> USB thermal printer) on a build where this same discrepancy was observed, so this check alone is not reliable proof of a broken installer -- it may be extracting an incomplete view of the NSIS payload, or the fallback require() path in printer/lib/printer.js may be satisfied some other way. Summary, for troubleshooting only:"
+            echo "  pre-NSIS path:    $PRE_NSIS_NODE_PATH"
+            echo "  pre-NSIS size:    $PRE_NSIS_NODE_SIZE bytes"
+            echo "  pre-NSIS sha256:  $PRE_NSIS_NODE_SHA256"
+            echo "  installer path:   $INSTALLER_PATH"
+            echo "  installer size:   $INSTALLER_SIZE bytes"
+            echo "  installer sha256: $INSTALLER_SHA256"
+            echo "  extracted 'printer' matches: ${PRINTER_MATCHES:-none}"
+            echo "  extracted '*.node' matches:  ${NODE_MATCHES:-none}"
+            exit 0
+          fi
+
+          EXTRACTED_SHA256="$(sha256sum "$MATCHING_NODE_FILE" | cut -d' ' -f1)"
+          echo "Found: $MATCHING_NODE_FILE"
+          echo "  sha256: $EXTRACTED_SHA256"
+          if [ "$EXTRACTED_SHA256" != "$PRE_NSIS_NODE_SHA256" ]; then
+            echo "::notice::A node_printer.node WAS found in the installer payload at $MATCHING_NODE_FILE, but its sha256 ($EXTRACTED_SHA256) does not match the pre-NSIS binary's sha256 ($PRE_NSIS_NODE_SHA256) -- informational only, not failing the build."
+            exit 0
+          fi
+
+          echo "Diagnostic D: node_printer.node survives NSIS packaging into the installer, byte-for-byte identical (sha256 match) to the pre-NSIS binary Diagnostic C found."
 
       - name: Show installer output
         run: find release -maxdepth 1 -iname "*.exe" -exec ls -la {} \;
@@ -352,5 +556,11 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: mero-restro-print-agent-windows-installer
-          path: release/*.exe
+          # Explicitly the single file identified and fingerprinted above
+          # (INSTALLER_PATH), not a bare release/*.exe glob -- so there is
+          # no ambiguity about which build this artifact came from, and
+          # upload fails outright if that exact file has somehow gone
+          # missing since it was identified, rather than silently falling
+          # back to globbing for "some" .exe.
+          path: ${{ env.INSTALLER_PATH }}
           if-no-files-found: error

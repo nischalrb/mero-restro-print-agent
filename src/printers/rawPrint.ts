@@ -260,6 +260,92 @@ async function waitForCupsJobToFinish(jobId: string, printerName: string): Promi
 }
 
 /**
+ * Strips absolute Windows filesystem paths (which can embed the Windows
+ * username, e.g. C:\\Users\\<name>\\AppData\\...) out of a string before it
+ * is allowed anywhere near an HTTP response. The FULL, unredacted detail
+ * still goes to the local log file via logDetailedPrinterLoadFailure()
+ * below — this redaction only applies to what /print and /test-print may
+ * return to the browser.
+ */
+function redactPathsForHttp(message: string): string {
+  return message.replace(/[A-Za-z]:\\[^\s"'()]+/g, "<path>");
+}
+
+/**
+ * Full, unredacted diagnostic dump for a failed `require("printer")` on
+ * Windows — written to the local agent.log ONLY, never returned over
+ * HTTP. This exists because until now, the generic user-facing message
+ * below ("This installation... is missing its Windows printing
+ * component") was the ONLY thing recorded anywhere: the real require()
+ * exception (a NODE_MODULE_VERSION mismatch, a missing .node file, "not a
+ * valid Win32 application", etc.) was logged as one line (message only)
+ * and then discarded — see the comment at this function's call site.
+ */
+function logDetailedPrinterLoadFailure(err: Error & { code?: string }): void {
+  // Only set inside a packaged Electron app (undefined under
+  // `npm run dev` / `ts-node-dev`, which don't apply here anyway).
+  // `resourcesPath` is an Electron-only addition to `process` that
+  // @types/node doesn't declare, hence the cast rather than a direct
+  // property access.
+  const resourcesPath = (process as NodeJS.Process & { resourcesPath?: string }).resourcesPath;
+
+  const candidatePaths = resourcesPath
+    ? {
+        "resources/app.asar": path.join(resourcesPath, "app.asar"),
+        "resources/app.asar.unpacked": path.join(resourcesPath, "app.asar.unpacked"),
+        "resources/app.asar.unpacked/node_modules/printer": path.join(resourcesPath, "app.asar.unpacked", "node_modules", "printer"),
+        "resources/app.asar.unpacked/node_modules/printer/lib/node_printer.node": path.join(
+          resourcesPath,
+          "app.asar.unpacked",
+          "node_modules",
+          "printer",
+          "lib",
+          "node_printer.node",
+        ),
+        "resources/app.asar.unpacked/node_modules/printer/build/Release/node_printer.node": path.join(
+          resourcesPath,
+          "app.asar.unpacked",
+          "node_modules",
+          "printer",
+          "build",
+          "Release",
+          "node_printer.node",
+        ),
+      }
+    : null;
+
+  const packagedPathReport = candidatePaths
+    ? Object.fromEntries(Object.entries(candidatePaths).map(([label, p]) => [label, { path: p, exists: fs.existsSync(p) }]))
+    : "process.resourcesPath is undefined -- not running inside a packaged Electron app, so these paths do not apply.";
+
+  logger.error(
+    "Windows printer native module failed to load -- full diagnostic dump (local log only, never sent over HTTP):\n" +
+      JSON.stringify(
+        {
+          error: {
+            name: err.name,
+            message: err.message,
+            code: err.code ?? null,
+            stack: err.stack,
+          },
+          runtime: {
+            platform: process.platform,
+            arch: process.arch,
+            electronVersion: process.versions.electron ?? null,
+            nodeVersion: process.versions.node,
+            modulesVersion: process.versions.modules,
+            resourcesPath: resourcesPath ?? null,
+            dirname: __dirname,
+          },
+          expectedPackagedPaths: packagedPathReport,
+        },
+        null,
+        2,
+      ),
+  );
+}
+
+/**
  * Lazily requires the optional `printer` native module only when actually
  * needed (Windows + USB) — this keeps the agent runnable on machines where
  * that module failed to install, for every other feature (discovery,
@@ -281,12 +367,31 @@ function sendViaWindowsSpooler(buffer: Buffer, printerName: string): Promise<voi
       // eslint-disable-next-line @typescript-eslint/no-var-requires
       printerModule = require("printer");
     } catch (err) {
-      logger.error(`Windows raw-print module ("printer") not available: ${(err as Error).message}`);
-      reject(
-        new Error(
-          "This installation of the Print Agent is missing its Windows printing component. Reinstall the Print Agent, or use a network (LAN) printer instead of USB.",
-        ),
+      const originalError = err as Error & { code?: string };
+
+      // Full detail (name/message/code/stack/runtime versions/on-disk
+      // path existence) — local log file only. This is the fix for "the
+      // real error is being swallowed": previously only
+      // originalError.message reached the log, and nothing at all
+      // reached the HTTP caller beyond the generic sentence below.
+      logDetailedPrinterLoadFailure(originalError);
+
+      const safeDetail = redactPathsForHttp(
+        `${originalError.name}${originalError.code ? ` (${originalError.code})` : ""}: ${originalError.message}`,
       );
+
+      const publicError = new Error(
+        "This installation of the Print Agent is missing its Windows printing component. Reinstall the Print Agent, or use a network (LAN) printer instead of USB.",
+      ) as Error & { errorCode?: string; nativePrinterError?: string };
+      // A short, redacted classifier + detail string — deliberately NOT
+      // the raw stack/paths — carried up through sendRaw() -> runJob()'s
+      // catch -> the job record -> the /print and /test-print JSON
+      // responses (see index.ts), as small ADDITIVE fields alongside the
+      // existing success/message/job contract, not a replacement for it.
+      publicError.errorCode = "PRINTER_NATIVE_MODULE_LOAD_FAILED";
+      publicError.nativePrinterError = safeDetail;
+
+      reject(publicError);
       return;
     }
 

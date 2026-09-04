@@ -175,7 +175,17 @@ export async function startAgentServer(): Promise<AgentServerHandle> {
     if (job.status === "printed") {
       res.json({ success: true, message: "Printed.", job });
     } else {
-      res.status(502).json({ success: false, message: describePrintFailure(job.error), job });
+      res.status(502).json({
+        success: false,
+        message: describePrintFailure(job.error),
+        job,
+        // Additive-only diagnostic fields for the Windows native-module
+        // loading failure (see rawPrint.ts) — omitted entirely (not even
+        // as null keys) when absent, so existing consumers that only
+        // check success/message/job see no shape change at all.
+        ...(job.errorCode ? { errorCode: job.errorCode } : {}),
+        ...(job.nativePrinterError ? { nativePrinterError: job.nativePrinterError } : {}),
+      });
     }
   });
 
@@ -194,7 +204,17 @@ export async function startAgentServer(): Promise<AgentServerHandle> {
     if (job.status === "printed") {
       res.json({ success: true, message: "Test Print Successful", job });
     } else {
-      res.status(502).json({ success: false, message: describePrintFailure(job.error), job });
+      res.status(502).json({
+        success: false,
+        message: describePrintFailure(job.error),
+        job,
+        // Additive-only diagnostic fields for the Windows native-module
+        // loading failure (see rawPrint.ts) — omitted entirely (not even
+        // as null keys) when absent, so existing consumers that only
+        // check success/message/job see no shape change at all.
+        ...(job.errorCode ? { errorCode: job.errorCode } : {}),
+        ...(job.nativePrinterError ? { nativePrinterError: job.nativePrinterError } : {}),
+      });
     }
   });
 
