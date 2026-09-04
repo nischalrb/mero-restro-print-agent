@@ -95,6 +95,26 @@ jobs:
       - name: Install dependencies (npm ci --ignore-scripts)
         run: npm ci --ignore-scripts
 
+      # --ignore-scripts (intentionally kept, see above) also skips
+      # electron's OWN postinstall ("node install.js"), which is what
+      # actually downloads the real Electron.exe for this platform/arch
+      # and writes node_modules/electron/path.txt. Without it, the npm
+      # "electron" package exists but has no runtime -- index.js throws
+      # "Electron failed to install correctly" the moment anything
+      # requires it (that's Gate A's failure). Run just this one
+      # package's install script explicitly, directly, so the legacy
+      # printer install script (prebuild-install || node-gyp rebuild)
+      # still never runs.
+      - name: Install Electron runtime
+        run: |
+          set -euo pipefail
+          node node_modules/electron/install.js
+
+      - name: Verify Electron runtime
+        run: |
+          set -euo pipefail
+          npx --no-install electron --version
+
       # Requirement: prove exactly what runtime/dependency versions this
       # run actually used, since the previous failure (Node 20.20.2 +
       # node-gyp 13's bundled undici hitting a WHATWG webidl API missing
