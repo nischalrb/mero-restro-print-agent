@@ -225,7 +225,7 @@ jobs:
           "
 
       - name: Build Windows x64 NSIS installer
-        run: npm run build:win
+        run: npm run build:win -- --publish never
 
       # Gate B -- packaging gate.
       - name: "Gate B: packaged app contains the native .node binary"
