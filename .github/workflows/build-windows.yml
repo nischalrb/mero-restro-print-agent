@@ -242,6 +242,108 @@ jobs:
           echo "Found packaged .node file(s):"
           echo "$NODE_FILES"
 
+      # Gate C -- packaged LAYOUT gate. Gate B above only proves *some*
+      # .node file exists somewhere under release/ after packaging; it
+      # does NOT prove the file is at the exact path printer/lib/printer.js
+      # actually requires it from at runtime inside the installed app. A
+      # native module can be compiled correctly (Gates A/B both green) and
+      # still fail to load post-install if electron-builder's asarUnpack
+      # step ever puts it somewhere other than
+      # resources/app.asar.unpacked/node_modules/printer/lib/node_printer.node
+      # -- e.g. left inside app.asar (native modules can't load from
+      # inside an asar archive at all, even though it would still show up
+      # in a plain filesystem "find" against app.asar itself, since asar
+      # is a single opaque file -- hence this step also greps the asar's
+      # own file listing, not just the filesystem), or only under
+      # .../build/Release/ without the lib/ copy. This step checks the
+      # real unpacked electron-builder output directory
+      # (release/win-unpacked/) against that exact expected path, not
+      # just "a .node file exists".
+      - name: "Gate C: win-unpacked layout matches printer's runtime require path"
+        run: |
+          set -euo pipefail
+
+          UNPACKED_DIR="release/win-unpacked"
+          RESOURCES_DIR="$UNPACKED_DIR/resources"
+          ASAR_PATH="$RESOURCES_DIR/app.asar"
+          UNPACKED_ASAR_DIR="$RESOURCES_DIR/app.asar.unpacked"
+          PRINTER_DIR="$UNPACKED_ASAR_DIR/node_modules/printer"
+          EXPECTED_NODE_PATH="$PRINTER_DIR/lib/node_printer.node"
+
+          echo "Checking $UNPACKED_DIR ..."
+          if [ ! -d "$UNPACKED_DIR" ]; then
+            echo "::error::$UNPACKED_DIR does not exist -- electron-builder did not produce the expected unpacked win target directory. Full release/ contents:"
+            find release -maxdepth 2 | sort || true
+            exit 1
+          fi
+
+          # --- Broad diagnostic dump, printed unconditionally, BEFORE any
+          # pass/fail decision -- so a future failure always has this
+          # context in the log regardless of which specific check below
+          # trips first. Two sources, because a .node file can be present
+          # in either without being at the runtime path printer/lib/
+          # printer.js actually requires it from:
+          #   1. The real filesystem under $RESOURCES_DIR (covers
+          #      app.asar.unpacked/ and anything NOT packed into the asar).
+          #   2. The archive listing of app.asar itself (covers a .node or
+          #      "printer" entry that electron-builder's auto-unpack
+          #      detection failed to pull out -- those never appear in a
+          #      filesystem "find" because app.asar is one opaque file).
+          echo ""
+          echo "=== Diagnostic: filesystem search for printer/node_printer.node/*.node under $RESOURCES_DIR ==="
+          find "$RESOURCES_DIR" \( -iname '*printer*' -o -iname '*.node' \) 2>/dev/null | sort || echo "(no matches on disk)"
+
+          echo ""
+          echo "=== Diagnostic: contents of $ASAR_PATH matching printer/node_printer ==="
+          if [ -f "$ASAR_PATH" ]; then
+            npx --no-install asar list "$ASAR_PATH" 2>/dev/null | grep -i -E 'printer|node_printer' || echo "(no matches inside app.asar)"
+          else
+            echo "(app.asar does not exist yet -- see the hard check below)"
+          fi
+
+          echo "Test: $ASAR_PATH"
+          if [ -f "$ASAR_PATH" ]; then
+            echo "  exists: true"
+          else
+            echo "::error::$ASAR_PATH does not exist -- the packaged app has no app.asar at all, which is not the expected electron-builder output shape."
+            exit 1
+          fi
+
+          echo "Test: $UNPACKED_ASAR_DIR"
+          if [ -d "$UNPACKED_ASAR_DIR" ]; then
+            echo "  exists: true"
+          else
+            echo "::error::$UNPACKED_ASAR_DIR does not exist -- asarUnpack (\"node_modules/printer/**/*\" in package.json's build config) did not take effect, so the native module for printer is sealed inside app.asar and CANNOT be loaded by Node's require() at runtime under any circumstance."
+            exit 1
+          fi
+
+          echo "Test: $PRINTER_DIR"
+          if [ -d "$PRINTER_DIR" ]; then
+            echo "  exists: true"
+          else
+            echo "::error::$PRINTER_DIR does not exist -- node_modules/printer was not unpacked at all."
+            exit 1
+          fi
+
+          echo "Test: $EXPECTED_NODE_PATH (the exact path printer/lib/printer.js requires the native binary from)"
+          if [ -f "$EXPECTED_NODE_PATH" ]; then
+            echo "  exists: true"
+            echo "Gate C passed -- native binary is present at the exact runtime path printer/lib/printer.js expects."
+          else
+            echo "::error::$EXPECTED_NODE_PATH does NOT exist. printer/lib/printer.js requires the native binary from exactly this path, so require('printer') will fail at runtime even though Gate A/B passed at build time."
+            echo "Searching the rest of the packaged printer directory for a misplaced .node file..."
+            FOUND_ELSEWHERE="$(find "$PRINTER_DIR" -iname '*.node' 2>/dev/null || true)"
+            if [ -n "$FOUND_ELSEWHERE" ]; then
+              echo "::error::Found .node file(s) elsewhere under $PRINTER_DIR, but NOT at the expected runtime path. Both paths, for comparison:"
+              echo "  expected (missing): $EXPECTED_NODE_PATH"
+              echo "  found instead:"
+              echo "$FOUND_ELSEWHERE" | sed 's/^/    /'
+            else
+              echo "::error::No .node file found anywhere under $PRINTER_DIR either -- expected path: $EXPECTED_NODE_PATH"
+            fi
+            exit 1
+          fi
+
       - name: Show installer output
         run: find release -maxdepth 1 -iname "*.exe" -exec ls -la {} \;
 
