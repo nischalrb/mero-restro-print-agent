@@ -132,7 +132,10 @@ jobs:
           node -p "require('undici/package.json').version"
 
       - name: Confirm our pinned modern node-gyp
-        run: npx --no-install node-gyp --version
+        shell: bash
+        run: |
+          set -euo pipefail
+          node node_modules/node-gyp/bin/node-gyp.js --version
 
       # This is the actual fix: compile printer directly against
       # Electron 31's ABI using OUR pinned node-gyp (^13.0.2), not
